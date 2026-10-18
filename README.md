@@ -1,3 +1,21 @@
+## 新版国内站适配（2026-10-18）
+
+使用 `app.igpsport.cn` 对应的 API，支持请求签名、Token 登录、记录详情和 FIT 下载。
+默认检查 IGP 最近 20 条记录中的骑行记录，按完整开始时间与行者记录去重；不是全历史迁移工具。
+行者记录分页读取。原有佳明与国际站支持状态不变。
+
+在仓库 Settings → Secrets and variables → Actions 设置 `USERNAME`、`PASSWORD`。
+只填值，不加引号；当前仍要求 IGP 和行者使用相同账号密码。不要填写 GARMIN_PASSWORD，除非要运行旧佳明分支。
+然后 Actions → IGPSport Data Sync To Xingzhe → Run workflow 手动执行。
+
+本地运行：`python -m pip install -r requirements.txt`，通过环境变量提供凭据后执行 `python ActivitySync.py`。
+离线测试：`python -m unittest -v`。测试不使用真实凭据，不执行网络同步。
+请勿将密码、Token、下载签名 URL 提交到仓库。
+
+签名 Python 代码来源及许可证见 `igp_vendor/`。WASM 来自该参考项目收录的官方前端文件，其独立上游许可证尚未确认。
+验证结果：9 个离线回归测试通过；已在线验证公开密钥握手及 WASM 签名生成。
+目前为本地适配版本；尚未完成真实账号的端到端同步验证。接口和前端版本以后仍可能变化。
+
 
 # IGPSPORT骑行记录同步行者(ActivitySync.py)
 

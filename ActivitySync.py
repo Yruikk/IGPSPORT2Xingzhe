@@ -8,7 +8,8 @@ from Crypto.Cipher import PKCS1_v1_5
 import garth
 import zipfile
 import hashlib
-import re
+import sys
+from igpsport import IGPSportClient, TIMEOUT
 
 def encrpt(password, public_key):
     rsa = RSA.importKey(public_key)
@@ -21,12 +22,12 @@ def syncData(username, password, garmin_email = None, garmin_password = None):
         "Accept-Encoding" : "gzip, deflate",
     }
 
-    igp_host = "my.igpsport.com"
     if os.getenv("IGPSPORT_REGION") == "global":
-        igp_host = "i.igpsport.com"
         print("国际版暂时不支持")
         return False
 
+    if not username or not password:
+        raise RuntimeError("Missing USERNAME or PASSWORD secrets")
     session = requests.session()
     type = 1 #default igp
 
@@ -47,50 +48,45 @@ def syncData(username, password, garmin_email = None, garmin_password = None):
     else:
         print("同步IGP数据")
 
-        url = "https://%s/Auth/Login" % igp_host
-        data = {
-            'username': username,
-            'password': password,
-        }
-        res = session.post(url, data, headers=headers)
-        setCookieValue = res.headers.get('Set-Cookie')
-        if(setCookieValue.find("loginTicket") == -1):
-            print("登录失败")
-            return False
-        loginToken = re.search(r'loginToken=(.*?);', setCookieValue).group(1)
-        if(loginToken == None):
-            print("登录失败")
-            return False
-        headers['Authorization'] = "Bearer %s" % loginToken
-        session.headers.update(headers)
-        # get igpsport list
-        url = "https://%s/Activity/ActivityList" % igp_host
-        res = session.get(url, headers=headers)
-        result = json.loads(res.text, strict=False)
-
-        activities = result["item"]
+        igp = IGPSportClient()
+        igp.login(username, password)
+        activities = igp.activities()
 
     # login xingzhe account
     encrypter_public_key    = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDmuQkBbijudDAJgfffDeeIButq\nWHZvUwcRuvWdg89393FSdz3IJUHc0rgI/S3WuU8N0VePJLmVAZtCOK4qe4FY/eKm\nWpJmn7JfXB4HTMWjPVoyRZmSYjW4L8GrWmh51Qj7DwpTADadF3aq04o+s1b8LXJa\n8r6+TIqqL5WUHtRqmQIDAQAB\n-----END PUBLIC KEY-----\n"
     safe_password           = encrpt(password, encrypter_public_key)
-    
+
     url     = "https://www.imxingzhe.com/api/v1/user/login/"
     data    = {
-        'account': username, 
-        'password': safe_password, 
+        'account': username,
+        'password': safe_password,
     }
-    res     = session.post(url, json=data, headers=headers)
+    res     = session.post(url, json=data, headers=headers, timeout=TIMEOUT)
     if res.status_code != 200:
         print("行者登录失败")
         return False
     result  = json.loads(res.text, strict=False)
     print("用户名:%s" % result['data']['username'])
 
-    # get current month data
-    url     = "https://www.imxingzhe.com/api/v1/pgworkout/?offset=0&limit=10&sport=3&year=&month="
-    res     = session.get(url, headers=headers)
-    result  = json.loads(res.text, strict=False)
-    data  = result["data"]["data"]
+    # Paginate destination records so older rides are not uploaded again.
+    data = []
+    offset = 0
+    seen_pages = set()
+    while True:
+        url = "https://www.imxingzhe.com/api/v1/pgworkout/?offset=%s&limit=100&sport=3&year=&month=" % offset
+        res = session.get(url, headers=headers, timeout=TIMEOUT)
+        res.raise_for_status()
+        page = res.json()["data"]["data"]
+        if not isinstance(page, list):
+            raise RuntimeError("Xingzhe workout list format changed")
+        fingerprint = json.dumps(page, sort_keys=True)
+        if page and fingerprint in seen_pages:
+            raise RuntimeError("Xingzhe pagination returned a repeated page")
+        seen_pages.add(fingerprint)
+        data.extend(page)
+        if len(page) < 100:
+            break
+        offset += len(page)
 
     sync_data = []
     # get not upload activity
@@ -99,12 +95,12 @@ def syncData(username, password, garmin_email = None, garmin_password = None):
     for activity in activities:
         if type == 2: #garmin
             dt        = datetime.strptime(activity["startTimeLocal"], "%Y-%m-%d %H:%M:%S")
-            dt2       = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, tzinfo=timezone)
+            dt2       = dt.replace(tzinfo=timezone) if dt.tzinfo is None else dt
             s_time    = dt2.timestamp()
             mk_time   = int(s_time) * 1000
         else:
-            dt        = datetime.strptime(activity["StartTime"], "%Y-%m-%d %H:%M:%S")
-            dt2       = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, tzinfo=timezone)
+            dt        = datetime.fromisoformat(activity["StartTime"])
+            dt2       = dt.replace(tzinfo=timezone) if dt.tzinfo is None else dt
             s_time    = dt2.timestamp()
             mk_time   = int(s_time) * 1000
 
@@ -138,7 +134,7 @@ def syncData(username, password, garmin_email = None, garmin_password = None):
                     zip_ref.extractall(rid)
                 with open(rid+"/"+rid+"_ACTIVITY.fit", 'rb') as fd:
                     data = fd.read()
-                    result = session.post(upload_url, files={
+                    result = session.post(upload_url, timeout=TIMEOUT, files={
                         "file_source": (None, "undefined", None),
                         "fit_filename": (None, rid+"_ACTIVITY.fit", None),
                         "md5": (None, hashlib.md5(data).hexdigest(), None),
@@ -152,26 +148,30 @@ def syncData(username, password, garmin_email = None, garmin_password = None):
                 print("sync rid:" + rid)
 
 
-                fit_json = "https://prod.zh.igpsport.com/service/web-gateway/web-analyze/activity/getDownloadUrl/%s" % rid
-                res = session.get(fit_json)
-                json_result = json.loads(res.text, strict=False)
-                #判断是否存在fitUrl
-                if 'data' in json_result:
-                    fit_url = json_result['data']
-                else:
-                    print("data not found")
-                    continue
-                
-                res     = session.get(fit_url)
-                result = session.post(upload_url, files={
+                fit_data = igp.download(rid)
+                result = session.post(upload_url, timeout=TIMEOUT, files={
                     "file_source": (None, "undefined", None),
                     "fit_filename": (None, sync_item["StartTime"]+'.fit', None),
-                    "md5": (None, hashlib.md5(res.content).hexdigest(), None),
+                    "md5": (None, hashlib.md5(fit_data).hexdigest(), None),
                     "name": (None, 'IGPSPORT-'+sync_item["StartTime"], None),
                     "sport": (None, 3, None),  # 骑行
-                    "fit_file": (sync_item["StartTime"]+'.fit', res.content, 'application/octet-stream')
+                    "fit_file": (sync_item["StartTime"]+'.fit', fit_data, 'application/octet-stream')
                 })
 
-            print("sync result:" + result.text)
+            result.raise_for_status()
+            payload = result.json()
+            if payload.get("success") is False or ("code" in payload and payload["code"] not in (0, 200)):
+                raise RuntimeError("Xingzhe rejected FIT upload")
+            print("upload request completed; verify the ride in Xingzhe")
+    return True
 
-activity = syncData(os.getenv("USERNAME"), os.getenv("PASSWORD"), os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
+if __name__ == "__main__":
+    try:
+        success = syncData(os.getenv("USERNAME"), os.getenv("PASSWORD"), os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
+    except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        # Do not print signed URLs, tokens or credential-bearing response bodies.
+        print("Sync failed: %s" % type(exc).__name__)
+        if isinstance(exc, RuntimeError):
+            print(str(exc))
+        sys.exit(1)
+    sys.exit(0 if success else 1)
